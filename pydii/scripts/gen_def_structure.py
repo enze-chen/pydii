@@ -1,296 +1,311 @@
 #!/usr/bin/env python
 """
-This file reads arguments and generate vacancy and antisite structures 
+This file reads arguments and generate vacancy and antisite structures
 in intermetallics.
 """
 
-from __future__ import division
-
-__author__ = "Bharat Medasani"
-__data__  = "Sept 14, 2014"
+__author__ = "Bharat Medasani, Enze Chen"
+__data__  = "Aug 10, 2020"
 
 import os
-import sys
-from argparse import ArgumentParser 
-import json
+from argparse import ArgumentParser
 
-from pymatgen.io.vaspio_set import MPGGAVaspInputSet
-from pymatgen.matproj.rest import MPRester
+from pymatgen.io.vasp.sets import MPMetalRelaxSet
+from pymatgen.ext.matproj import MPRester
 from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
+from pymatgen.core.periodic_table import Element
+from pymatgen.core.sites import Site
 from pymatgen.core.structure import Structure
-from pymatgen.serializers.json_coders import pmg_load, pmg_dump
-from pymatgen.analysis.defects.point_defects import Vacancy
-from pymatgen.io.vaspio.vasp_input import Poscar, Kpoints
+from pymatgen.analysis.defects.core import Vacancy
+from pymatgen.io.vasp.inputs import Kpoints
 
 
 def get_sc_scale(inp_struct, final_site_no):
     lengths = inp_struct.lattice.abc
     no_sites = inp_struct.num_sites
-    mult = (final_site_no/no_sites*lengths[0]*lengths[1]*lengths[2]) ** (1/3)
+    mult = (final_site_no/no_sites*lengths[0]*lengths[1]*lengths[2]) ** (1./3)
     num_mult = [int(round(mult/l)) for l in lengths]
     num_mult = [i if i > 0 else 1 for i in num_mult]
     return num_mult
 
 
-def vac_antisite_def_struct_gen(mpid, mapi_key, cellmax):
-    if not mpid:
+def vac_antisite_def_struct_gen(mpid, mapi_key, cellmax, struct_file=None):
+    if not mpid and not struct_file:
         print ("============\nERROR: Provide an mpid\n============")
         return
 
-    if not mapi_key:
-        with MPRester() as mp:
-            struct = mp.get_structure_by_material_id(mpid)
+    # Get primitive structure from the Materials Project DB
+    if not struct_file:
+        if not mapi_key:
+            with MPRester() as mp:
+                struct = mp.get_structure_by_material_id(mpid)
+        else:
+            with MPRester(mapi_key) as mp:
+                struct = mp.get_structure_by_material_id(mpid)
     else:
-        with MPRester(mapi_key) as mp:
-            struct = mp.get_structure_by_material_id(mpid)
+        struct = Structure.from_file(struct_file)
 
-    prim_struct_sites = len(struct.sites)
-    struct = SpacegroupAnalyzer(struct).get_conventional_standard_structure()
-    conv_struct_sites = len(struct.sites)
-    conv_prim_rat = int(conv_struct_sites/prim_struct_sites)
-    sc_scale = get_sc_scale(struct,cellmax)
+    sga = SpacegroupAnalyzer(struct)
+    prim_struct = sga.find_primitive()
+    #prim_struct_sites = len(prim_struct.sites)
+    #conv_struct = sga.get_conventional_standard_structure()
+    #conv_struct_sites = len(conv_struct.sites)
+    #conv_prim_ratio = int(conv_struct_sites / prim_struct_sites)
 
-    mpvis = MPGGAVaspInputSet()
+    # Default VASP settings
+    def_vasp_incar_param = {'ISIF':2, 'EDIFF':1e-6, 'EDIFFG':0.001,}
+    kpoint_den = 15000
 
-    # Begin defaults: All default settings.
-    blk_vasp_incar_param = {'IBRION':-1,'EDIFF':1e-4,'EDIFFG':0.001,'NSW':0,}
-    def_vasp_incar_param = {'ISIF':2,'NELM':99,'IBRION':2,'EDIFF':1e-6, 
-                            'EDIFFG':0.001,'NSW':40,}
-    kpoint_den = 6000
-    # End defaults
-    
-    ptcr_flag = True
-    try:
-        potcar = mpvis.get_potcar(struct)
-    except:
-        print ("VASP POTCAR folder not detected.\n" \
-              "Only INCAR, POSCAR, KPOINTS are generated.\n" \
-              "If you have VASP installed on this system, \n" \
-              "refer to pymatgen documentation for configuring the settings.")
-        ptcr_flag = False
+    # Create bulk structure and associated VASP files
+    sc_scale = get_sc_scale(inp_struct=prim_struct, final_site_no=cellmax)
+    blk_sc = prim_struct.copy()
+    blk_sc.make_supercell(scaling_matrix=sc_scale)
+    site_no = blk_sc.num_sites
 
-
-    vac = Vacancy(struct, {}, {})
-    scs = vac.make_supercells_with_defects(sc_scale)
-    site_no = scs[0].num_sites
-    if site_no > cellmax:
+    # Rescale if needed
+    while site_no > cellmax:
         max_sc_dim = max(sc_scale)
         i = sc_scale.index(max_sc_dim)
         sc_scale[i] -= 1
-        scs = vac.make_supercells_with_defects(sc_scale)
+        blk_sc = prim_struct.copy()
+        blk_sc.make_supercell(scaling_matrix=sc_scale)
+        site_no = blk_sc.num_sites
+    
+    blk_str_sites = set(blk_sc.sites)
+    custom_kpoints = Kpoints.automatic_density(blk_sc, kppa=kpoint_den)
+    mpvis = MPMetalRelaxSet(blk_sc, user_incar_settings=def_vasp_incar_param,
+                            user_kpoints_settings=custom_kpoints)
 
-    for i in range(len(scs)):
-        sc = scs[i]
-        poscar = mpvis.get_poscar(sc)
-        kpoints = Kpoints.automatic_density(sc,kpoint_den)
-        incar = mpvis.get_incar(sc)
-        if ptcr_flag:
-            potcar = mpvis.get_potcar(sc)
+    if mpid:
+        root_fldr = mpid
+    else:
+        root_fldr = struct.composition.reduced_formula
 
-        interdir = mpid
-        if not i:
-            fin_dir = os.path.join(interdir,'bulk')
-            try:
-                os.makedirs(fin_dir)
-            except:
-                pass
-            incar.update(blk_vasp_incar_param)
-            incar.write_file(os.path.join(fin_dir,'INCAR'))
-            poscar.write_file(os.path.join(fin_dir,'POSCAR'))
-            if ptcr_flag:
-                potcar.write_file(os.path.join(fin_dir,'POTCAR'))
-            kpoints.write_file(os.path.join(fin_dir,'KPOINTS'))
-        else:
-            blk_str_sites = set(scs[0].sites)
-            vac_str_sites = set(sc.sites)
-            vac_sites = blk_str_sites - vac_str_sites
-            vac_site = list(vac_sites)[0]
-            site_mult = int(vac.get_defectsite_multiplicity(i-1)/conv_prim_rat)
-            vac_site_specie = vac_site.specie
-            vac_symbol = vac_site.specie.symbol
+    fin_dir = os.path.join(root_fldr, 'bulk')
+    mpvis.write_input(fin_dir)
+    if not mpid:    # write the input structure if mpid is not used
+        struct.to(fmt='poscar', filename=os.path.join(fin_dir, 'POSCAR.uc'))
 
-            vac_dir ='vacancy_{}_mult-{}_sitespecie-{}'.format(str(i),
-                    site_mult, vac_symbol)
-            fin_dir = os.path.join(interdir,vac_dir)
-            try:
-                os.makedirs(fin_dir)
-            except:
-                pass
-            incar.update(def_vasp_incar_param)
-            poscar.write_file(os.path.join(fin_dir,'POSCAR'))
-            incar.write_file(os.path.join(fin_dir,'INCAR'))
-            if ptcr_flag:
-                potcar.write_file(os.path.join(fin_dir,'POTCAR'))
-            kpoints.write_file(os.path.join(fin_dir,'KPOINTS'))
+    # Create each defect structure and associated VASP files
+    # First find all unique defect sites
+    periodic_struct = sga.get_symmetrized_structure()
+    unique_sites = list(set([periodic_struct.find_equivalent_sites(site)[0] \
+                             for site in periodic_struct.sites]))
+    temp_struct = Structure.from_sites(sorted(unique_sites))
+    prim_struct2 = SpacegroupAnalyzer(temp_struct).find_primitive()
+    prim_struct2.lattice = prim_struct.lattice  # a little hacky
+    for i, site in enumerate(prim_struct2.sites):
+        vac = Vacancy(structure=prim_struct, defect_site=site)
+        vac_sc = vac.generate_defect_structure(supercell=sc_scale)
 
-            # Antisite generation at all vacancy sites
-            struct_species = scs[0].types_of_specie
-            for specie in set(struct_species)-set([vac_site_specie]):
-                subspecie_symbol = specie.symbol
-                anti_struct = sc.copy()
-                anti_struct.append(specie, vac_site.frac_coords)
-                poscar = mpvis.get_poscar(anti_struct)
-                incar = mpvis.get_incar(anti_struct)
-                incar.update(def_vasp_incar_param)
-                as_dir ='antisite_{}_mult-{}_sitespecie-{}_subspecie-{}'.format(
-                        str(i), site_mult, vac_symbol, subspecie_symbol)
-                fin_dir = os.path.join(interdir,as_dir)
-                try:
-                    os.makedirs(fin_dir)
-                except:
-                    pass
-                poscar.write_file(os.path.join(fin_dir,'POSCAR'))
-                incar.write_file(os.path.join(fin_dir,'INCAR'))
-                if ptcr_flag:
-                        potcar.write_file(os.path.join(fin_dir,'POTCAR'))
-                kpoints.write_file(os.path.join(fin_dir,'KPOINTS'))
+        # Get vacancy site information
+        vac_str_sites = set(vac_sc.sites)
+        vac_sites = blk_str_sites - vac_str_sites
+        vac_site = next(iter(vac_sites))
+        site_mult = vac.get_multiplicity()
+        vac_site_specie = vac_site.specie
+        vac_symbol = vac_site_specie.symbol
 
-def substitute_def_struct_gen(mpid, solute, mapi_key, cellmax):
-    if not mpid:
+        custom_kpoints = Kpoints.automatic_density(vac_sc, kppa=kpoint_den)
+        mpvis = MPMetalRelaxSet(vac_sc,
+                                user_incar_settings=def_vasp_incar_param,
+                                user_kpoints_settings=custom_kpoints)
+        vac_dir = 'vacancy_{}_mult-{}_sitespecie-{}'.format(
+                    str(i+1), site_mult, vac_symbol)
+        fin_dir = os.path.join(root_fldr, vac_dir)
+        mpvis.write_input(fin_dir)
+
+        # Antisites generation at the vacancy site
+        struct_species = blk_sc.species
+        for specie in set(struct_species) - set([vac_site_specie]):
+            specie_symbol = specie.symbol
+            anti_sc = vac_sc.copy()
+            anti_sc.append(specie, vac_site.frac_coords)
+            mpvis = MPMetalRelaxSet(anti_sc,
+                                    user_incar_settings=def_vasp_incar_param,
+                                    user_kpoints_settings=custom_kpoints)
+            anti_dir = 'antisite_{}_mult-{}_sitespecie-{}_subspecie-{}'.format(
+                        str(i+1), site_mult, vac_symbol, specie_symbol)
+            fin_dir = os.path.join(root_fldr, anti_dir)
+            mpvis.write_input(fin_dir)
+
+
+def substitute_def_struct_gen(mpid, solute, mapi_key, cellmax,
+                              struct_file=None):
+    if not mpid and not struct_file:
         print ("============\nERROR: Provide an mpid\n============")
         return
     if not solute:
         print ("============\nERROR: Provide solute atom\n============")
         return
 
-    if not mapi_key:
-        with MPRester() as mp:
-            struct = mp.get_structure_by_material_id(mpid)
+    # Get primitive structure from the Materials Project DB
+    if not struct_file:
+        if not mapi_key:
+            with MPRester() as mp:
+                struct = mp.get_structure_by_material_id(mpid)
+        else:
+            with MPRester(mapi_key) as mp:
+                struct = mp.get_structure_by_material_id(mpid)
     else:
-        with MPRester(mapi_key) as mp:
-            struct = mp.get_structure_by_material_id(mpid)
-    prim_struct_sites = len(struct.sites)
-    struct = SpacegroupAnalyzer(struct).get_conventional_standard_structure()
-    conv_struct_sites = len(struct.sites)
-    conv_prim_rat = int(conv_struct_sites/prim_struct_sites)
+        struct = Structure.from_file(struct_file)
 
-    mpvis = MPGGAVaspInputSet()
+    if mpid:
+        root_fldr = mpid
+    else:
+        root_fldr = struct.composition.reduced_formula
 
-    # Begin defaults: All default settings.
-    blk_vasp_incar_param = {'IBRION':-1,'EDIFF':1e-4,'EDIFFG':0.001,'NSW':0,}
-    def_vasp_incar_param = {'ISIF':2,'NELM':99,'IBRION':2,'EDIFF':1e-6, 
-                            'EDIFFG':0.001,'NSW':40,}
-    kpoint_den = 6000
-    # End defaults
-    
-    # Check if POTCAR file can be geneated
-    ptcr_flag = True
-    try:
-        potcar = mpvis.get_potcar(struct)
-    except:
-        print ("VASP POTCAR folder not detected.\n" \
-              "Only INCAR, POSCAR, KPOINTS are generated.\n" \
-              "If you have VASP installed on this system, \n" \
-              "refer to pymatgen documentation for configuring the settings.")
-        ptcr_flag = False
+    sga = SpacegroupAnalyzer(struct)
+    prim_struct = sga.find_primitive()
+    #prim_struct_sites = len(prim_struct.sites)
+    #conv_struct = sga.get_conventional_standard_structure()
+    #conv_struct_sites = len(conv_struct.sites)
+    #conv_prim_ratio = int(conv_struct_sites / prim_struct_sites)
 
-    vac = Vacancy(struct, {}, {})
-    sc_scale = get_sc_scale(struct,cellmax)
-    scs = vac.make_supercells_with_defects(sc_scale)
-    site_no = scs[0].num_sites
-    if site_no > cellmax:
-            max_sc_dim = max(sc_scale)
-            i = sc_scale.index(max_sc_dim)
-            sc_scale[i] -= 1
-            scs = vac.make_supercells_with_defects(sc_scale)
+    # Default VASP settings
+    def_vasp_incar_param = {'ISIF':2, 'EDIFF':1e-6, 'EDIFFG':0.001,}
+    kpoint_den = 15000
 
-    interdir = mpid
-    blk_str_sites = set(scs[0].sites)
-    for i in range(1,len(scs)):
-        sc = scs[i]
-        vac_str_sites = set(sc.sites)
+    # Create each substitutional defect structure and associated VASP files
+    sc_scale = get_sc_scale(inp_struct=prim_struct, final_site_no=cellmax)
+    blk_sc = prim_struct.copy()
+    blk_sc.make_supercell(scaling_matrix=sc_scale)
+    site_no = blk_sc.num_sites
+
+    # Rescale if needed
+    while site_no > cellmax:
+        max_sc_dim = max(sc_scale)
+        i = sc_scale.index(max_sc_dim)
+        sc_scale[i] -= 1
+        blk_sc = prim_struct.copy()
+        blk_sc.make_supercell(scaling_matrix=sc_scale)
+        site_no = blk_sc.num_sites
+
+    # Create solute structures at vacancy sites
+    # First find all unique defect sites
+    blk_str_sites = set(blk_sc.sites)
+    periodic_struct = sga.get_symmetrized_structure()
+    unique_sites = list(set([periodic_struct.find_equivalent_sites(site)[0] \
+                             for site in periodic_struct.sites]))
+    temp_struct = Structure.from_sites(sorted(unique_sites))
+    prim_struct2 = SpacegroupAnalyzer(temp_struct).find_primitive()
+    prim_struct2.lattice = prim_struct.lattice  # a little hacky
+    for i, site in enumerate(prim_struct2.sites):
+        vac = Vacancy(structure=prim_struct, defect_site=site)
+        vac_sc = vac.generate_defect_structure(supercell=sc_scale)
+
+        # Get vacancy site information
+        vac_str_sites = set(vac_sc.sites)
         vac_sites = blk_str_sites - vac_str_sites
-        vac_site = list(vac_sites)[0]
-        site_mult = int(vac.get_defectsite_multiplicity(i-1)/conv_prim_rat)
-        vac_site_specie = vac_site.specie
+        vac_site = next(iter(vac_sites))
         vac_specie = vac_site.specie.symbol
+        site_mult = vac.get_multiplicity()
 
-        # Solute substitution defect generation at all vacancy sites
-        struct_species = scs[0].types_of_specie
-        solute_struct = sc.copy()
+        # Solute substitution defect generation at the vacancy site
+        solute_struct = vac_sc.copy()
         solute_struct.append(solute, vac_site.frac_coords)
+        custom_kpoints = Kpoints.automatic_density(solute_struct,
+                                                   kppa=kpoint_den)
+        mpvis = MPMetalRelaxSet(solute_struct,
+                                user_incar_settings=def_vasp_incar_param,
+                                user_kpoints_settings=custom_kpoints)
 
-        incar = mpvis.get_incar(solute_struct)
-        incar.update(def_vasp_incar_param)
-        poscar = mpvis.get_poscar(solute_struct)
-        kpoints = Kpoints.automatic_density(solute_struct,kpoint_den)
-        if ptcr_flag:
-            potcar = mpvis.get_potcar(solute_struct)
-
+        # Generate VASP directory
         sub_def_dir ='solute_{}_mult-{}_sitespecie-{}_subspecie-{}'.format(
-                str(i), site_mult, vac_specie, solute)
-        fin_dir = os.path.join(interdir,sub_def_dir)
-        try:
-            os.makedirs(fin_dir)
-        except:
-            pass
-        poscar.write_file(os.path.join(fin_dir,'POSCAR'))
-        incar.write_file(os.path.join(fin_dir,'INCAR'))
-        kpoints.write_file(os.path.join(fin_dir,'KPOINTS'))
-        if ptcr_flag:
-            potcar.write_file(os.path.join(fin_dir,'POTCAR'))
+                str(i+1), site_mult, vac_specie, solute)
+        fin_dir = os.path.join(root_fldr, sub_def_dir)
+        mpvis.write_input(fin_dir)
+
 
 def im_vac_antisite_def_struct_gen():
     m_description = 'Command to generate vacancy and antisite defect ' \
-                    'structures for intermetallics.' 
+                    'structures for intermetallics.'
 
     parser = ArgumentParser(description=m_description)
 
-    parser.add_argument("--mpid",
+    parser.add_argument(
+            "--mpid",
+            default=None,
             type=str.lower,
             help="Materials Project id of the intermetallic structure.\n" \
                  "For more info on Materials Project, please refer to " \
                  "www.materialsproject.org")
 
-    parser.add_argument("--mapi_key",
-            default = None,
+    parser.add_argument(
+            "--struct",
+            default=None,
+            type=str,
+            help="Filename of the intermetallic structure.")
+
+    parser.add_argument(
+            "--mapi_key",
+            default=None,
             help="Your Materials Project REST API key.\n" \
                  "For more info, please refer to " \
-                 "www.materialsproject.org/opne")
+                 "www.materialsproject.org/open")
 
-    parser.add_argument("--cellmax",
+    parser.add_argument(
+            "--cellmax",
             type=int,
             default=128,
             help="Maximum number of atoms in supercell.\n" \
                  "The default is 128\n" \
                  "Keep in mind the number of atoms in the supercell" \
                  "may vary from the provided number including the default.")
-    
+
     args = parser.parse_args()
-    vac_antisite_def_struct_gen(args.mpid, args.mapi_key, args.cellmax)
+    vac_antisite_def_struct_gen(args.mpid, args.mapi_key, args.cellmax,
+                                struct_file=args.struct)
+
 
 def im_sol_sub_def_struct_gen():
     m_description = 'Command to generate solute substitution defect ' \
-                    'structures for intermetallics.' 
+                    'structures for intermetallics.'
 
     parser = ArgumentParser(description=m_description)
 
-    parser.add_argument("--mpid",
+    parser.add_argument(
+            "--mpid",
+            default=None,
             type=str.lower,
             help="Materials Project id of the intermetallic structure.\n" \
                  "For more info on Materials Project, please refer to " \
                  "www.materialsproject.org")
 
-    parser.add_argument("--solute", help="Solute Element")
+    parser.add_argument(
+            "--struct",
+            default=None,
+            type=str,
+            help="Filename of the intermetallic structure." \
+                 "Supported file types include CIF, POSCAR/CONTCAR," \
+                 "CHGCAR, LOCPOT, vasprun.xml, CSSR, Netcdf, and pymatgen JSONs.")
 
-    parser.add_argument("--mapi_key",
-            default = None,
+    parser.add_argument(
+            "--solute",
+            type=str,
+            help="Solute Element")
+
+    parser.add_argument(
+            "--mapi_key",
+            default=None,
             help="Your Materials Project REST API key.\n" \
                  "For more info, please refer to " \
-                 "www.materialsproject.org/opne")
+                 "www.materialsproject.org/open")
 
-    parser.add_argument("--cellmax",
+    parser.add_argument(
+            "--cellmax",
             type=int,
             default=128,
             help="Maximum number of atoms in supercell.\n" \
                  "The default is 128\n" \
                  "Keep in mind the number of atoms in the supercell" \
                  "may vary from the provided number including the default.")
-    
+
     args = parser.parse_args()
-    substitute_def_struct_gen(args.mpid,args.solute,args.mapi_key,args.cellmax)
+    substitute_def_struct_gen(args.mpid, args.solute, args.mapi_key,
+                              args.cellmax, struct_file=args.struct)
+
 
 if __name__ == '__main__':
-    im_vac_antisite_def_struct_gen()
-    #im_sol_sub_def_struct_gen()
-
+    # im_vac_antisite_def_struct_gen()
+    im_sol_sub_def_struct_gen()
